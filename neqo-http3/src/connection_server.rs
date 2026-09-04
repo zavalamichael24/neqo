@@ -215,13 +215,18 @@ impl Http3ServerHandler {
         self.needs_processing = true;
     }
 
-    /// Whether this connection has events to process or data to send.
-    pub(crate) fn should_be_processed(&mut self) -> bool {
+    /// Whether this connection has events, data to send, or a datagram sweep due.  The sweep check
+    /// is skipped once closing: the transport stops expiring queues then, so a stale deadline would
+    /// keep this true.
+    pub(crate) fn should_be_processed(&mut self, conn: &Connection, now: Instant) -> bool {
         if self.needs_processing {
             self.needs_processing = false;
             return true;
         }
-        self.base_handler.has_data_to_send() || self.events.has_events()
+        self.base_handler.has_data_to_send()
+            || self.events.has_events()
+            || (self.base_handler.state().active()
+                && Http3Connection::datagram_sweep_due(conn, now))
     }
 
     // This function takes the provided result and check for an error.

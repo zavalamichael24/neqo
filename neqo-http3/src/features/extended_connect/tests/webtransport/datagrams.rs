@@ -4,7 +4,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, time::Duration};
 
 use neqo_common::{Encoder, event::Provider as _, to_u64};
 use neqo_transport::{ConnectionParameters, DatagramQueueOutcome, streams::SendGroupId};
@@ -83,6 +83,33 @@ fn max_datagram_size_smaller_than_session_prefix() {
 }
 
 #[test]
+fn datagram_expires_before_being_sent() {
+    let mut wt = WtTest::new();
+    let wt_session = wt.create_wt_session();
+    let t0 = now();
+
+    wt_session.set_datagram_max_age(Some(Duration::from_millis(5)), t0);
+    assert_eq!(
+        wt_session.send_datagram(DGRAM, Some(1), t0, SendGroupId::new(0), 0),
+        Ok(DatagramQueueOutcome::Ok)
+    );
+    assert_eq!(wt_session.datagram_queue_capacity().queued_datagrams, 1);
+
+    // No packets ever need to be built in between: expiry must not wait on
+    // that. Driving the server's own HTTP/3 tick (not exchange_packets,
+    // which uses its own clock) is enough on its own.
+    let later = t0 + Duration::from_millis(10);
+    drop(wt.server.process_output(later));
+
+    assert_eq!(
+        wt_session.datagram_queue_capacity().queued_datagrams,
+        0,
+        "the stale datagram must be gone before it is ever handed to the QUIC layer"
+    );
+    assert_eq!(wt_session.stats().datagrams_expired_outgoing, 1);
+}
+
+#[test]
 fn datagram_larger_than_peers_limit_is_rejected_synchronously() {
     let mut wt = WtTest::new();
     let wt_session = wt.create_wt_session();
@@ -97,6 +124,7 @@ fn datagram_larger_than_peers_limit_is_rejected_synchronously() {
         Err(crate::Error::Transport(neqo_transport::Error::TooMuchData)),
         "an oversized datagram must fail before ever reaching the queue"
     );
+    assert_eq!(wt_session.datagram_queue_capacity().queued_datagrams, 0);
 }
 
 /// The other side of the boundary: a datagram of exactly `max_datagram_size`
@@ -115,6 +143,7 @@ fn datagram_of_exactly_the_peers_limit_is_accepted() {
         wt_session.send_datagram(&largest, Some(1), now(), SendGroupId::new(0), 0),
         Ok(DatagramQueueOutcome::Ok)
     );
+    assert_eq!(wt_session.datagram_queue_capacity().queued_datagrams, 1);
 }
 
 #[test]
@@ -192,6 +221,74 @@ fn outgoing_datagram_space_available_forwarded() {
             .any(|e| matches!(e, Http3ServerEvent::OutgoingDatagramSpaceAvailable { .. })),
         "OutgoingDatagramSpaceAvailable was not forwarded to the HTTP/3 server"
     );
+}
+
+#[test]
+fn server_processes_a_connection_whose_only_pending_work_is_an_expired_datagram() {
+    let mut wt = WtTest::new();
+    let wt_session = wt.create_wt_session();
+    let t0 = now();
+
+    // Enqueue without marking the connection as needing processing: the
+    // datagram's own expiry must be enough on its own to get this
+    // connection processed later, with nothing else giving it a reason.
+    wt_session.set_datagram_max_age(Some(Duration::from_millis(5)), t0);
+    _ = wt_session
+        .send_datagram_without_marking_needs_processing(DGRAM, Some(1), t0)
+        .unwrap();
+    assert_eq!(wt_session.datagram_queue_capacity().queued_datagrams, 1);
+
+    let later = t0 + Duration::from_millis(10);
+    drop(wt.server.process_output(later));
+
+    assert_eq!(
+        wt_session.datagram_queue_capacity().queued_datagrams,
+        0,
+        "the datagram's own expiry must get this connection processed"
+    );
+    assert_eq!(wt_session.stats().datagrams_expired_outgoing, 1);
+}
+
+#[test]
+fn close_session_stats_include_datagrams_expired_since_the_last_sweep() {
+    let mut wt = WtTest::new();
+    let wt_session = wt.create_wt_session();
+    let t0 = now();
+
+    wt_session.set_datagram_max_age(Some(Duration::from_millis(5)), t0);
+    assert_eq!(
+        wt_session.send_datagram(DGRAM, Some(1), t0, SendGroupId::new(0), 0),
+        Ok(DatagramQueueOutcome::Ok)
+    );
+
+    let stats = wt_session
+        .close_session(0, "", t0 + Duration::from_millis(10))
+        .unwrap();
+    assert_eq!(stats.datagrams_expired_outgoing, 1);
+}
+
+/// A client that resets the session takes the server's queued datagrams
+/// with it.
+#[test]
+fn session_reset_by_client_drops_the_servers_queued_datagrams() {
+    let mut wt = WtTest::new();
+    let wt_session = wt.create_wt_session();
+    let session_id = wt_session.stream_id();
+
+    for id in 0..3 {
+        assert_eq!(
+            wt_session.send_datagram(DGRAM, Some(id), now(), SendGroupId::new(0), 0),
+            Ok(DatagramQueueOutcome::Ok)
+        );
+    }
+    assert!(wt_session.next_datagram_expiry().is_some());
+    wt.client
+        .cancel_fetch(session_id, crate::Error::HttpNone.code())
+        .unwrap();
+    let reset = wt.client.process_output(now()).dgram().unwrap();
+    drop(wt.server.process(Some(reset), now()));
+
+    assert_eq!(wt_session.next_datagram_expiry(), None);
 }
 
 #[test]
