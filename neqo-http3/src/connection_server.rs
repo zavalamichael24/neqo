@@ -217,7 +217,8 @@ impl Http3ServerHandler {
 
     /// Whether this connection has events, data to send, or a datagram sweep due.  The sweep check
     /// is skipped once closing: the transport stops expiring queues then, so a stale deadline would
-    /// keep this true.
+    /// keep this true.  The sweep runs before packets are built, so a sent count reaches the
+    /// session's stats on the next call.
     pub(crate) fn should_be_processed(&mut self, conn: &Connection, now: Instant) -> bool {
         if self.needs_processing {
             self.needs_processing = false;
